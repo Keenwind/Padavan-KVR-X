@@ -58,6 +58,7 @@ jobs:
         sed -i '/CONFIG_FIRMWARE_INCLUDE_FRPC/d' .config
         sed -i '/CONFIG_FIRMWARE_INCLUDE_FRPS/d' .config
         sed -i '/CONFIG_FIRMWARE_INCLUDE_ALIDDNS/d' .config
+        sed -i '/CONFIG_FIRMWARE_INCLUDE_DNSPOD/d' .config
         sed -i '/CONFIG_FIRMWARE_INCLUDE_SHADOWSOCKS/d' .config
         sed -i '/CONFIG_FIRMWARE_INCLUDE_V2RAY/d' .config
         sed -i '/CONFIG_FIRMWARE_INCLUDE_XRAY/d' .config
