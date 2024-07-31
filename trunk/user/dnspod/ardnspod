@@ -1,0 +1,421 @@
+#!/bin/sh
+#
+
+###################################################################
+# AnripDdns v6.4.0
+#
+# Dynamic DNS using DNSPod API
+#
+# Author: Rehiy, https://github.com/rehiy
+#                https://www.rehiy.com/?s=dnspod
+#
+# Collaborators: https://github.com/rehiy/dnspod-shell/graphs/contributors
+#
+# Usage: please refer to `ddnspod.sh`
+#
+################################################################### params ##
+
+export arToken
+
+# The url to be used for querying public ip address.
+
+export arIp4QueryUrl="http://ipv4.rehi.org/ip"
+export arIp6QueryUrl="http://ipv6.rehi.org/ip"
+
+# The temp file to store the last record ip
+
+export arLastRecordFile=/tmp/ardnspod_last_record
+
+# The error code to return when a ddns record is not changed
+# By default, report unchanged event as success
+
+export arErrCodeUnchanged=0
+
+################################################################### logger ##
+
+# Output log to stderr
+
+arLog() {
+
+    >&2 echo "$@"
+
+}
+
+################################################################### http client ##
+
+# Use curl or wget open url
+# Args: url postdata
+
+arRequest() {
+
+    local url="$1"
+    local data="$2"
+
+    local params=""
+    local agent="AnripDdns/6.4.0(wang@rehiy.com)"
+
+    if type curl >/dev/null 2>&1; then
+        if echo $url | grep -q https; then
+            params="$params -k"
+        fi
+        if [ -n "$data" ]; then
+            params="$params -d $data"
+        fi
+        curl -s -A "$agent" $params $url
+        return $?
+    fi
+
+    if type wget >/dev/null 2>&1; then
+        if echo $url | grep -q https; then
+            params="$params --no-check-certificate"
+        fi
+        if [ -n "$data" ]; then
+            params="$params --post-data $data"
+        fi
+        wget -qO- -U "$agent" $params $url
+        return $?
+    fi
+
+    return 1
+
+}
+
+################################################################### ipv4 util ##
+
+# Get regular expression for IPv4 LAN addresses
+
+arLanIp4() {
+
+    local lanIps="^$"
+
+    lanIps="$lanIps|(^10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$)"            # RFC1918
+    lanIps="$lanIps|(^100\.(6[4-9]|[7-9][0-9])\.[0-9]{1,3}\.[0-9]{1,3}$)"  # RFC6598 100.64.x.x - 100.99.x.x
+    lanIps="$lanIps|(^100\.1([0-1][0-9]|2[0-7])\.[0-9]{1,3}\.[0-9]{1,3}$)" # RFC6598 100.100.x.x - 100.127.x.x
+    lanIps="$lanIps|(^127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$)"           # RFC1122
+    lanIps="$lanIps|(^169\.254\.[0-9]{1,3}\.[0-9]{1,3}$)"                  # RFC3927
+    lanIps="$lanIps|(^172\.(1[6-9]|2[0-9]|3[0-1])\.[0-9]{1,3}\.[0-9]{1,3}$)" # RFC1918
+    lanIps="$lanIps|(^192\.0\.2\.[0-9]{1,3}$)"                             # RFC5737
+    lanIps="$lanIps|(^192\.168\.[0-9]{1,3}\.[0-9]{1,3}$)"                  # RFC1918
+    lanIps="$lanIps|(^198\.1[8-9]\.[0-9]{1,3}\.[0-9]{1,3}$)"               # RFC2544
+    lanIps="$lanIps|(^198\.51\.100\.[0-9]{1,3}$)"                          # RFC5737
+    lanIps="$lanIps|(^203\.0\.113\.[0-9]{1,3}$)"                           # RFC5737
+    lanIps="$lanIps|(^2[4-5][0-9]\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$)"   # RFC1112
+
+    echo $lanIps
+
+}
+
+# Get IPv4 by ip route or network
+
+arWanIp4() {
+
+    local hostIp
+    local lanIps=$(arLanIp4)
+
+    case $(uname) in
+        'Linux')
+            hostIp=$(ip -o -4 route get 100.64.0.1 | grep -oE 'src [0-9\.]+' | awk '{print $2}' | grep -Ev "$lanIps")
+        ;;
+        Darwin|FreeBSD)
+            hostIp=$(ifconfig | grep "inet " | grep -v 127.0.0.1 | awk '{print $2}' | grep -Ev "$lanIps")
+        ;;
+    esac
+
+    if [ -z "$hostIp" ]; then
+        hostIp=$(arRequest $arIp4QueryUrl)
+    fi
+
+    if [ -z "$hostIp" ]; then
+        return 2
+    fi
+
+    if [ -z "$(echo $hostIp | grep -E '^[0-9\.]+$')" ]; then
+        arLog "> arWanIp4 - Invalid ip address"
+        return 1
+    fi
+
+    echo $hostIp
+
+}
+
+# Get IPv4 from a specific interface
+# Args: interface
+
+arDevIp4() {
+
+    local hostIp
+    local lanIps=$(arLanIp4)
+
+    case $(uname) in
+        'Linux')
+            hostIp=$(ip -o -4 addr show dev $1 primary | grep -oE 'inet [0-9.]+' | awk '{print $2}' | grep -Ev "$lanIps" | head -n 1)
+        ;;
+    esac
+
+    if [ -z "$hostIp" ]; then
+        arLog "> arDevIp4 - Can't get ip address"
+        return 1
+    fi
+
+    if [ -z "$(echo $hostIp | grep -E '^[0-9\.]+$')" ]; then
+        arLog "> arDevIp4 - Invalid ip address"
+        return 1
+    fi
+
+    echo $hostIp
+
+}
+
+################################################################### ipv6 util ##
+
+# Get regular expression for IPv6 LAN addresses
+
+arLanIp6() {
+
+    local lanIps="(^$)"
+
+    lanIps="$lanIps|(^::1$)"                            # RFC4291
+    lanIps="$lanIps|(^64:[fF][fF]9[bB]:)"               # RFC6052, RFC8215
+    lanIps="$lanIps|(^100::)"                           # RFC6666
+    lanIps="$lanIps|(^2001:2:0?:)"                      # RFC5180
+    lanIps="$lanIps|(^2001:[dD][bB]8:)"                 # RFC3849
+    lanIps="$lanIps|(^[fF][cdCD][0-9a-fA-F]{2}:)"       # RFC4193 Unique local addresses
+    lanIps="$lanIps|(^[fF][eE][8-9a-bA-B][0-9a-fA-F]:)" # RFC4291 Link-local addresses
+
+    echo $lanIps
+
+}
+
+# Get IPv6 by ip route or network
+
+arWanIp6() {
+
+    local hostIp
+    local lanIps=$(arLanIp6)
+
+    case $(uname) in
+        'Linux')
+            hostIp=$(ip -o -6 route get 100::1 | grep -oE 'src [0-9a-fA-F:]+' | awk '{print $2}' | grep -Ev "$lanIps")
+        ;;
+    esac
+
+    if [ -z "$hostIp" ]; then
+        hostIp=$(arRequest $arIp6QueryUrl)
+    fi
+
+    if [ -z "$hostIp" ]; then
+        arLog "> arWanIp6 - Can't get ip address"
+        return 1
+    fi
+
+    if [ -z "$(echo $hostIp | grep -E '^[0-9a-fA-F:]+$')" ]; then
+        arLog "> arWanIp6 - Invalid ip address"
+        return 1
+    fi
+
+    echo $hostIp
+
+}
+
+# Get IPv6 from a specific interface
+# Args: interface
+
+arDevIp6() {
+
+    local hostIp
+    local lanIps=$(arLanIp6)
+
+    case $(uname) in
+        'Linux')
+            # Try obtain home address (a speical permanent address for mobile devices)
+            hostIp=$(ip -o -6 addr show dev $1 scope global home | grep -oE 'inet6 [0-9a-fA-F:]+' | awk '{print $2}' | grep -Ev "$lanIps")
+            if [ -z "$hostIp" ]; then # Try obtain permanent address
+                hostIp=$(ip -o -6 addr show dev $1 scope global permanent | grep -oE 'inet6 [0-9a-fA-F:]+' | awk '{print $2}' | grep -Ev "$lanIps")
+            fi
+            if [ -z "$hostIp" ]; then # Try obtain non-deprecated primary (non-temporary) non-mngtmpaddr (mngtmpaddr is template for temporary address creation) address then
+                hostIp=$(ip -o -6 addr show dev $1 scope global -deprecated primary | grep -v mngtmpaddr | grep -oE 'inet6 [0-9a-fA-F:]+' | awk '{print $2}' | grep -Ev "$lanIps")
+            fi
+            if [ -z "$hostIp" ]; then # Try obtain non-deprecated primary address then
+                hostIp=$(ip -o -6 addr show dev $1 scope global -deprecated primary | grep -oE 'inet6 [0-9a-fA-F:]+' | awk '{print $2}' | grep -Ev "$lanIps")
+            fi
+            if [ -z "$hostIp" ]; then # Try obtain non-deprecated address any at last
+                hostIp=$(ip -o -6 addr show dev $1 scope global -deprecated | grep -oE 'inet6 [0-9a-fA-F:]+' | awk '{print $2}' | grep -Ev "$lanIps")
+            fi
+            hostIp=$(echo "$hostIp" | head -n 1) # Fetch at most one address
+        ;;
+    esac
+
+    if [ -z "$hostIp" ]; then
+        arLog "> arDevIp6 - Can't get ip address"
+        return 1
+    fi
+
+    if [ -z "$(echo $hostIp | grep -E '^[0-9a-fA-F:]+$')" ]; then
+        arLog "> arDevIp6 - Invalid ip address"
+        return 1
+    fi
+
+    echo $hostIp
+
+}
+
+################################################################### dnspod api ##
+
+# Dnspod Bridge
+# Args: interface data
+
+arDdnsApi() {
+
+    local dnsapi="https://dnsapi.cn/${1:?'Info.Version'}"
+    local params="login_token=$arToken&format=json&lang=en&$2"
+
+    arRequest "$dnsapi" "$params"
+
+}
+
+# Fetch Record Id
+# Args: domain subdomain recordType
+
+arDdnsLookup() {
+
+    local errMsg
+
+    local recordId
+
+    if [ "$2" != "@" ]; then
+        # No sub_domain for root domain
+        subDomainRule="&sub_domain=$2"
+    fi
+
+    # Get Record Id
+    recordId=$(arDdnsApi "Record.List" "domain=$1${subDomainRule}&record_type=$3")
+    recordId=$(echo $recordId | sed 's/.*"id":"\([0-9]*\)".*/\1/')
+
+    if ! [ "$recordId" -gt 0 ] 2>/dev/null ;then
+        errMsg=$(echo $recordId | sed 's/.*"message":"\([^\"]*\)".*/\1/')
+        arLog "> arDdnsLookup - $errMsg"
+        return 1
+    fi
+
+    echo $recordId
+}
+
+# Update Record Value
+# Args: domain subdomain recordId recordType [hostIp]
+
+arDdnsUpdate() {
+
+    local errMsg
+
+    local recordRs
+    local recordCd
+    local recordIp
+
+    local lastRecordIp
+    local lastRecordIpFile="$arLastRecordFile.$3"
+
+    # fetch last ip
+    if [ -f $lastRecordIpFile ]; then
+        lastRecordIp=$(cat $lastRecordIpFile)
+    fi
+
+    # fetch from api
+    if [ -z "$lastRecordIp" ]; then
+        recordRs=$(arDdnsApi "Record.Info" "domain=$1&record_id=$3")
+        recordCd=$(echo $recordRs | sed 's/.*{"code":"\([0-9]*\)".*/\1/')
+        lastRecordIp=$(echo $recordRs | sed 's/.*,"value":"\([0-9a-fA-F\.\:]*\)".*/\1/')
+    fi
+
+    # update ip
+    if [ -z "$5" ]; then
+        recordRs=$(arDdnsApi "Record.Ddns" "domain=$1&sub_domain=$2&record_id=$3&record_type=$4&record_line=%e9%bb%98%e8%ae%a4")
+    else
+        if [ "$5" = "$lastRecordIp" ]; then
+            arLog "> arDdnsUpdate - unchanged: $lastRecordIp" # unchanged event
+            return $arErrCodeUnchanged
+        fi
+        recordRs=$(arDdnsApi "Record.Ddns" "domain=$1&sub_domain=$2&record_id=$3&record_type=$4&value=$5&record_line=%e9%bb%98%e8%ae%a4")
+    fi
+
+    # parse result
+    recordCd=$(echo $recordRs | sed 's/.*{"code":"\([0-9]*\)".*/\1/')
+    recordIp=$(echo $recordRs | sed 's/.*,"value":"\([0-9a-fA-F\.\:]*\)".*/\1/')
+
+    # check result
+    if [ "$recordCd" != "1" ]; then
+        errMsg=$(echo $recordRs | sed 's/.*,"message":"\([^"]*\)".*/\1/')
+        arLog "> arDdnsUpdate - error: $errMsg"
+        return 1
+    elif [ "$recordIp" = "$lastRecordIp" ]; then
+        arLog "> arDdnsUpdate - unchanged: $recordIp" # unchanged event
+        return $arErrCodeUnchanged
+    else
+        arLog "> arDdnsUpdate - updated: $recordIp" # updated event
+        if [ -n "$lastRecordIpFile" ]; then
+            echo $recordIp > $lastRecordIpFile
+        fi
+        return 0
+    fi
+
+}
+
+################################################################### task hub ##
+
+# DDNS Check
+# Args: domain subdomain [6|4] interface
+
+arDdnsCheck() {
+
+    local errCode
+
+    local hostIp
+
+    local recordId
+    local recordType
+
+    arLog "=== Check $2.$1 ==="
+    arLog "Fetching Host Ip"
+
+    if   [ "$3" = "6" ] && [ -n "$4" ]; then
+        recordType=AAAA
+        hostIp=$(arDevIp6 "$4")
+    elif [ "$3" = "4" ] && [ -n "$4" ]; then
+        recordType=A
+        hostIp=$(arDevIp4 "$4")
+    elif [ "$3" = "6" ]; then
+        recordType=AAAA
+        hostIp=$(arWanIp6)
+    else
+        recordType=A
+        hostIp=$(arWanIp4)
+    fi
+
+    errCode=$?
+    if [ $errCode -eq 0 ]; then
+        arLog "> Host Ip: $hostIp"
+        arLog "> Record Type: $recordType"
+    elif [ $errCode -eq 2 ]; then
+        arLog "> Host Ip: Auto"
+        arLog "> Record Type: $recordType"
+    else
+        arLog "$hostIp"
+        return $errCode
+    fi
+
+    arLog "Fetching RecordId"
+    recordId=$(arDdnsLookup "$1" "$2" "$recordType")
+
+    errCode=$?
+    if [ $errCode -eq 0 ]; then
+        arLog "> Record Id: $recordId"
+    else
+        arLog "$recordId"
+        return $errCode
+    fi
+
+    arLog "Updating Record value"
+    arDdnsUpdate "$1" "$2" "$recordId" "$recordType" "$hostIp"
+
+}
+
+################################################################### end ##
